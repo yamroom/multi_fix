@@ -1,7 +1,7 @@
-File_Path,File_Name,cgc,ids,vth
-/mnt/c/Users/user/Desktop/test_agent/multi_fix/output/C=1_lkvth0 = 0/all.txt,all.txt,1,2,3
-/mnt/c/Users/user/Desktop/test_agent/multi_fix/output/C=1_lkvth0 = 2/all.txt,all.txt,1,2,3
-/mnt/c/Users/user/Desktop/test_agent/multi_fix/output/C=2_lkvth0 = 0/all.txt,all.txt,1,2,3
-/mnt/c/Users/user/Desktop/test_agent/multi_fix/output/C=2_lkvth0 = 2/all.txt,all.txt,1,2,3
-/mnt/c/Users/user/Desktop/test_agent/multi_fix/output/C=3_lkvth0 = 0/all.txt,all.txt,1,2,3
-/mnt/c/Users/user/Desktop/test_agent/multi_fix/output/C=3_lkvth0 = 2/all.txt,all.txt,1,2,3
+File_Path,File_Name,D_2,E,F
+/mnt/c/Users/user/Desktop/test_agent/multi_fix/output/D=1.1_A=2/all.txt,all.txt,1,2,3
+/mnt/c/Users/user/Desktop/test_agent/multi_fix/output/D=1.1_A=4/all.txt,all.txt,1,2,3
+/mnt/c/Users/user/Desktop/test_agent/multi_fix/output/D=3.8_A=2/all.txt,all.txt,1,2,3
+/mnt/c/Users/user/Desktop/test_agent/multi_fix/output/D=3.8_A=4/all.txt,all.txt,1,2,3
+/mnt/c/Users/user/Desktop/test_agent/multi_fix/output/D=5.4_A=2/all.txt,all.txt,1,2,3
+/mnt/c/Users/user/Desktop/test_agent/multi_fix/output/D=5.4_A=4/all.txt,all.txt,1,2,3
