@@ -6,6 +6,7 @@ use File::Basename;
 use Cwd qw(abs_path);
 use File::Path qw(make_path remove_tree);
 use File::Find;
+use Storable ();
 
 #
 # 使用說明 (繁體中文)
@@ -70,11 +71,11 @@ my $data_file = 'output/results/merged_data.csv';
 # 調參行為
 my $join_key = 'File_Path';
 my $tol = 0.05;
-my $step = 1.02;
 my $min_param = -1e6;
 my $max_param = 1e6;
 my $model = 'add';
-my $max_rounds = 10;
+my $max_rounds = 20; # 在 auto 模式中作為 BO 評估 budget
+my $bo_seed = 12345;
 my @select_params = ();
 
 # 流程預設
@@ -86,7 +87,6 @@ my $help = 0;
 # =========================
 # 內部參數 (不建議改)
 # =========================
-my $step_set = 0;
 my $params_cli = '';
 my %opt_seen;
 
@@ -108,7 +108,6 @@ GetOptions(
     'params=s'      => set_opt('params', sub { $params_cli = $_[0]; }),
     'join-key=s'    => set_opt('join-key', sub { $join_key = $_[0]; }),
     'tol=f'         => set_opt('tol', sub { $tol = $_[0]; }),
-    'step=f'        => set_opt('step', sub { $step = $_[0]; $step_set = 1; }),
     'min-param=f'   => set_opt('min-param', sub { $min_param = $_[0]; }),
     'max-param=f'   => set_opt('max-param', sub { $max_param = $_[0]; }),
     'out=s'         => set_opt('out', sub { $out_file = $_[0]; }),
@@ -120,6 +119,7 @@ GetOptions(
     'no-tune'       => set_opt('no-tune', sub { $no_tune = 1; }),
     'collect'       => set_opt('collect', sub { $collect = 1; }),
     'max-rounds=i'  => set_opt('max-rounds', sub { $max_rounds = $_[0]; }),
+    'bo-seed=i'     => set_opt('bo-seed', sub { $bo_seed = $_[0]; }),
     'help'          => set_opt('help', sub { $help = 1; }),
 ) or die "Usage: $0 --collect|--no-tune|--auto [options]\nUse --help for details.\n";
 
@@ -132,8 +132,8 @@ Usage:
 
 Modes (exactly one is required):
   --collect   Collect only. Read .txt files under output recursively. No command execution, no tuning.
-  --no-tune   Build output folders + run commands + collect data. No tuning.
-  --auto      Build output folders + run commands + collect + tuning loop.
+  --no-tune   Build output folders + initialize template params + run commands + collect data.
+  --auto      Build output folders + run commands + collect + per-directory BO tuning.
 
 Repeated key collection:
   Repeated base key lines are indexed by appearance order (e.g. D=... -> D_1, D_2, D_3...).
@@ -147,8 +147,8 @@ Mode / option matrix (strict):
   no-tune:
     --no-tune --data --tuning-file --template
   auto:
-    --auto --data --target --out --report --params --model --tol --step
-    --min-param --max-param --max-rounds --join-key --tuning-file --template
+    --auto --data --target --out --report --params --model --tol --bo-seed
+    --min-param --max-param --max-rounds(BO budget) --join-key --tuning-file --template
 
 If an option is not allowed for the selected mode, the script fails fast.
 
@@ -174,7 +174,7 @@ sub validate_mode_options {
     my %allowed_by_mode = (
         'collect' => { map { $_ => 1 } qw(collect data) },
         'no-tune' => { map { $_ => 1 } qw(no-tune data tuning-file template) },
-        'auto'    => { map { $_ => 1 } qw(auto data target params join-key tol step min-param max-param out report model tuning-file template max-rounds) },
+        'auto'    => { map { $_ => 1 } qw(auto data target params join-key tol min-param max-param out report model tuning-file template max-rounds bo-seed) },
     );
 
     my $allowed = $allowed_by_mode{$mode} || {};
@@ -902,50 +902,6 @@ sub count_join_key_matches {
 # 參數對應
 # 根據 %default_param_map 建立欄位->參數 與可調參數清單
 # =========================
-sub read_prev_params {
-    my ($file, $param_list_ref) = @_;
-    return {} unless -e $file;
-    my ($header, $rows) = read_csv($file);
-    my %by_key;
-    for my $row (@$rows) {
-        my $key = $row->{$join_key} // '';
-        next if $key eq '';
-        for my $p (@$param_list_ref) {
-            my $v = $row->{$p};
-            next unless is_number($v);
-            $by_key{$key}{$p} = $v + 0;
-        }
-    }
-    return \%by_key;
-}
-
-sub params_from_results {
-    my ($results, $param_list_ref) = @_;
-    my %by_key;
-    for my $res (@$results) {
-        my $key = $res->{key};
-        next unless defined $key && $key ne '';
-        my %vals;
-        for my $p (@$param_list_ref) {
-            $vals{$p} = $res->{param_value}{$p};
-        }
-        $by_key{$key} = \%vals;
-    }
-    return \%by_key;
-}
-
-sub params_changed {
-    my ($prev, $curr, $param_list_ref) = @_;
-    return 1 unless $prev;
-    for my $p (@$param_list_ref) {
-        my $a = $prev->{$p};
-        my $b = $curr->{$p};
-        return 1 if !defined $a || !defined $b;
-        return 1 if abs($a - $b) > 1e-12;
-    }
-    return 0;
-}
-
 sub build_default_map {
     my ($data_header, $data_rows) = @_;
     my %map_by_key;
@@ -986,224 +942,499 @@ sub build_param_context {
 }
 
 # =========================
-# 核心調參（逐步更新參數直到誤差收斂）
+# no-tune 初始化（依 model 預填 token）
 # =========================
-sub compute_params {
-    my ($data_rows, $output_cols, $iter_limit, $prev_params, $target_by_key, $map_by_key, $param_list_ref, $param_allowed_ref) = @_;
-    my @results;
-    my $all_ok_global = 1;
-
-    for my $row (@$data_rows) {
-        my $key = $row->{$join_key} // '';
-        my $target_row = $target_by_key->{$key};
-        if (!$target_row) {
-            warn "[WARN] target missing for key '$key'\n";
-            $all_ok_global = 0;
-            next;
-        }
-        my $map_row = $map_by_key->{$key} // {};
-
-        my $init_val = ($model eq 'add') ? 0.0 : 1.0;
-        my %param_value = map { $_ => $init_val } @$param_list_ref;
-        if ($prev_params && exists $prev_params->{$key}) {
-            my $prev = $prev_params->{$key};
-            for my $p (@$param_list_ref) {
-                if (exists $prev->{$p} && is_number($prev->{$p})) {
-                    $param_value{$p} = $prev->{$p} + 0;
-                }
-            }
-        }
-
-        my %final_adjusted;
-        my %final_error;
-        my $converged = 0;
-        my $used_any = 0;
-
-        for (my $iter = 0; $iter < $iter_limit; $iter++) {
-            my %ratios_for_param;
-            my %deltas_for_param;
-            my $all_ok = 1;
-            my $any_used = 0;
-
-            for my $col (@$output_cols) {
-                my $data_val = $row->{$col};
-                my $target_val = $target_row->{$col};
-                my $param_name = $map_row->{$col};
-
-                next if !defined $param_name || $param_name eq '';
-                if (!$param_allowed_ref->{$param_name}) {
-                    warn "[WARN] param '$param_name' not in param_list for key '$key' column '$col'\n" if $iter == 0;
-                    next;
-                }
-
-                if (!is_number($data_val) || !is_number($target_val)) {
-                    # Missing collected value (e.g. indexed underflow) is summarized in collect stage.
-                    # Suppress per-cell noise but keep warnings for other non-numeric issues.
-                    if ($iter == 0) {
-                        my $missing_data = (!defined $data_val || $data_val =~ /^\s*$/);
-                        if (!$missing_data) {
-                            warn "[WARN] non-numeric data/target for key '$key' column '$col'\n";
-                        }
-                    }
-                    next;
-                }
-                if ($model eq 'mul' && ($data_val == 0 || $target_val == 0)) {
-                    warn "[WARN] zero data/target for key '$key' column '$col'\n" if $iter == 0;
-                    next;
-                }
-
-                $any_used = 1;
-                $used_any = 1;
-
-                my $error;
-                if ($target_val == 0) {
-                    $error = abs($data_val);
-                } else {
-                    $error = abs($data_val / $target_val - 1);
-                }
-                $final_adjusted{$col} = $data_val;
-                $final_error{$col} = $error;
-
-                if ($error >= $tol) {
-                    $all_ok = 0;
-                }
-
-                if ($model eq 'mul') {
-                    my $ratio = $target_val / $data_val;
-                    push @{ $ratios_for_param{$param_name} }, $ratio if $ratio > 0;
-                } else {
-                    my $delta = $target_val - $data_val;
-                    push @{ $deltas_for_param{$param_name} }, $delta;
-                }
-            }
-
-            if (!$any_used) {
-                warn "[WARN] no adjustable outputs for key '$key'\n";
-                $all_ok = 0;
-                last;
-            }
-
-            if ($all_ok) {
-                $converged = 1;
-                last;
-            }
-
-            for my $p (@$param_list_ref) {
-                if ($model eq 'mul') {
-                    my $gm = geom_mean(@{ $ratios_for_param{$p} // [] });
-                    next unless defined $gm;
-                    my $ratio = clamp($gm, 1.0 / $step, $step);
-                    my $new_val = $param_value{$p} * $ratio;
-                    $new_val = clamp($new_val, $min_param, $max_param);
-                    $param_value{$p} = $new_val;
-                } else {
-                    my $avg = mean(@{ $deltas_for_param{$p} // [] });
-                    next unless defined $avg;
-                    my $delta = clamp($avg, -$step, $step);
-                    my $new_val = $param_value{$p} + $delta;
-                    $new_val = clamp($new_val, $min_param, $max_param);
-                    $param_value{$p} = $new_val;
-                }
-            }
-        }
-
-        if (!$converged && $used_any && !$auto) {
-            warn "[WARN] did not converge for key '$key' within iter_limit=$iter_limit\n";
-        }
-
-        if (!$used_any) {
-            $all_ok_global = 0;
-        } else {
-            for my $col (@$output_cols) {
-                if (defined $final_error{$col} && $final_error{$col} >= $tol) {
-                    $all_ok_global = 0;
-                    last;
-                }
-            }
-        }
-
-        my $param_changed = params_changed($prev_params ? $prev_params->{$key} : undef, \%param_value, $param_list_ref);
-        my $dir = ($key ne '') ? dirname($key) : '';
-
-        push @results, {
-            row => $row,
-            key => $key,
-            dir => $dir,
-            param_value => \%param_value,
-            final_adjusted => \%final_adjusted,
-            final_error => \%final_error,
-            converged => $converged,
-            param_changed => $param_changed,
-        };
+sub build_no_tune_init_values_from_model {
+    my $init_val = ($model eq 'mul') ? 1 : 0;
+    my %token_values;
+    for my $token (values %default_param_map) {
+        next unless defined $token && $token ne '';
+        $token_values{$token} = $init_val;
     }
+    return \%token_values;
+}
 
-    return (\@results, $all_ok_global);
+sub initialize_no_tune_tokens_in_dirs {
+    my ($dirs_ref, $tuning_basename, $token_values_ref) = @_;
+    return unless $dirs_ref && @$dirs_ref;
+    return unless $token_values_ref && %$token_values_ref;
+
+    for my $dir (@$dirs_ref) {
+        my $path = "$dir/$tuning_basename";
+        next unless -f $path;
+        my $content = read_file($path);
+        my $changed = 0;
+
+        for my $token (sort { length($b) <=> length($a) } keys %$token_values_ref) {
+            my $replacement = format_val($token_values_ref->{$token});
+            my $count = ($content =~ s/\b\Q$token\E\b/$replacement/g);
+            $changed = 1 if $count;
+        }
+        write_file($path, $content) if $changed;
+    }
 }
 
 # =========================
-# 輸出寫入（tuned_params / tuning_report / 覆蓋調參檔）
+# BO 輔助（單目錄評估、候選提案、並行任務）
+# =========================
+sub run_commands_in_dir {
+    my ($dir, $commands_ref) = @_;
+    my $cwd = Cwd::getcwd();
+    chdir $dir or do {
+        warn "[WARN] cannot enter directory '$dir'\n";
+        return 0;
+    };
+    my $ok = 1;
+    for my $cmd (@$commands_ref) {
+        my $status = system($cmd);
+        if ($status != 0) {
+            warn "[WARN] command failed in '$dir': $cmd\n";
+            $ok = 0;
+            last;
+        }
+    }
+    chdir $cwd or die "Cannot return to working directory '$cwd'\n";
+    return $ok;
+}
+
+sub parse_occurrence_map_from_file {
+    my ($file) = @_;
+    return unless defined $file && -f $file;
+
+    my %occ;
+    open my $fh, '<', $file or return;
+    while (my $line = <$fh>) {
+        chomp $line;
+        my @pairs = extract_pairs_from_line($line);
+        for my $pair (@pairs) {
+            my ($key, $val) = @$pair;
+            next unless is_number($val);
+            push @{ $occ{$key} }, $val + 0;
+        }
+    }
+    close $fh;
+    return \%occ;
+}
+
+sub get_value_for_col_from_occ {
+    my ($occ_ref, $col) = @_;
+    return undef unless $occ_ref && defined $col;
+
+    my ($base, $idx, $style) = parse_indexed_key($col);
+    if (defined $base) {
+        my @vals = @{ $occ_ref->{$base} // [] };
+        return $vals[$idx - 1] if @vals >= $idx;
+        my @explicit = @{ $occ_ref->{$col} // [] };
+        return $explicit[0] if @explicit;
+        return undef;
+    }
+    my @vals = @{ $occ_ref->{$col} // [] };
+    return $vals[0] if @vals;
+    return undef;
+}
+
+sub vec_to_param_hash {
+    my ($params_ref, $vec_ref) = @_;
+    my %h;
+    for my $i (0 .. $#$params_ref) {
+        $h{$params_ref->[$i]} = $vec_ref->[$i];
+    }
+    return \%h;
+}
+
+sub param_hash_to_serialized {
+    my ($param_hash_ref, $ordered_params_ref) = @_;
+    return join(',', map { $_ . '=' . format_val($param_hash_ref->{$_}) } @$ordered_params_ref);
+}
+
+sub kernel_mu_sigma {
+    my ($candidate_ref, $samples_ref, $losses_ref, $lengthscale) = @_;
+    my $n = scalar(@$samples_ref);
+    return (1e12, 0) if $n == 0;
+
+    my $mean_loss = mean(@$losses_ref);
+    $mean_loss = 1e12 unless defined $mean_loss;
+
+    my $var_fallback = 0;
+    for my $loss (@$losses_ref) {
+        $var_fallback += ($loss - $mean_loss) ** 2;
+    }
+    $var_fallback = $n ? ($var_fallback / $n) : 0;
+    my $std_fallback = sqrt($var_fallback + 1e-12);
+
+    my $sum_w = 0;
+    my $sum_wy = 0;
+    for my $i (0 .. $n - 1) {
+        my $sample = $samples_ref->[$i];
+        my $dist2 = 0;
+        for my $d (0 .. $#$candidate_ref) {
+            my $diff = $candidate_ref->[$d] - $sample->[$d];
+            $dist2 += $diff * $diff;
+        }
+        my $w = exp(-$dist2 / (2 * $lengthscale * $lengthscale));
+        $sum_w += $w;
+        $sum_wy += $w * $losses_ref->[$i];
+    }
+    return ($mean_loss, $std_fallback) if $sum_w <= 1e-30;
+
+    my $mu = $sum_wy / $sum_w;
+    my $sum_var = 0;
+    for my $i (0 .. $n - 1) {
+        my $sample = $samples_ref->[$i];
+        my $dist2 = 0;
+        for my $d (0 .. $#$candidate_ref) {
+            my $diff = $candidate_ref->[$d] - $sample->[$d];
+            $dist2 += $diff * $diff;
+        }
+        my $w = exp(-$dist2 / (2 * $lengthscale * $lengthscale));
+        my $delta = $losses_ref->[$i] - $mu;
+        $sum_var += $w * $delta * $delta;
+    }
+    my $sigma = sqrt(($sum_var / $sum_w) + 1e-12);
+    return ($mu, $sigma);
+}
+
+sub propose_candidate_by_ucb {
+    my ($samples_ref, $losses_ref, $dim, $lo, $hi, $candidate_count, $kappa) = @_;
+    my $range = $hi - $lo;
+    $range = 1 if $range <= 0;
+    my $lengthscale = 0.2 * $range * sqrt($dim || 1);
+    $lengthscale = 1e-6 if $lengthscale <= 0;
+
+    my $best_score;
+    my @best_vec;
+    for (1 .. $candidate_count) {
+        my @vec = map { $lo + rand() * ($hi - $lo) } (1 .. $dim);
+        my ($mu, $sigma) = kernel_mu_sigma(\@vec, $samples_ref, $losses_ref, $lengthscale);
+        my $score = $mu - $kappa * $sigma;
+        if (!defined $best_score || $score < $best_score) {
+            $best_score = $score;
+            @best_vec = @vec;
+        }
+    }
+    return \@best_vec;
+}
+
+sub build_bo_tasks {
+    my ($data_rows_ref, $output_cols_ref, $target_by_key_ref, $map_by_key_ref, $param_allowed_ref, $tuning_basename) = @_;
+    my @tasks;
+
+    for my $row (@$data_rows_ref) {
+        my $key = $row->{$join_key} // '';
+        next if $key eq '';
+        my $target_row = $target_by_key_ref->{$key};
+        next unless $target_row;
+
+        my $map_row = $map_by_key_ref->{$key} // {};
+        my @active_cols;
+        my %active_params;
+        for my $col (@$output_cols_ref) {
+            my $param = $map_row->{$col};
+            next unless defined $param && $param ne '';
+            next unless $param_allowed_ref->{$param};
+            my $target_val = $target_row->{$col};
+            next unless is_number($target_val);
+            push @active_cols, $col;
+            $active_params{$param} = 1;
+        }
+        my @active_params = sort keys %active_params;
+
+        my $dir = dirname($key);
+        my $template_path = "$dir/$tuning_basename";
+        my $template_content = -f $template_path ? read_file($template_path) : undef;
+
+        push @tasks, {
+            key => $key,
+            file_name => $row->{File_Name} // '',
+            dir => $dir,
+            template_path => $template_path,
+            template_content => $template_content,
+            target_row => $target_row,
+            active_cols => \@active_cols,
+            active_params => \@active_params,
+        };
+    }
+
+    return @tasks;
+}
+
+sub evaluate_task_params {
+    my ($task, $param_values_ref) = @_;
+    my $failure_loss = 1e12;
+
+    return { loss => $failure_loss, converged => 0, status => 'template_missing' }
+        unless defined $task->{template_content};
+
+    my $content = apply_template($task->{template_content}, $param_values_ref);
+    write_file($task->{template_path}, $content);
+    my $ok = run_commands_in_dir($task->{dir}, \@run_commands);
+    return { loss => $failure_loss, converged => 0, status => 'run_failed' } unless $ok;
+
+    my $occ_ref = parse_occurrence_map_from_file($task->{key});
+    return { loss => $failure_loss, converged => 0, status => 'output_missing' } unless $occ_ref;
+
+    my @sq_errors;
+    my $max_abs_error = 0;
+    for my $col (@{ $task->{active_cols} }) {
+        my $target = $task->{target_row}{$col};
+        my $actual = get_value_for_col_from_occ($occ_ref, $col);
+        return { loss => $failure_loss, converged => 0, status => "missing_col:$col" }
+            unless is_number($target) && is_number($actual);
+
+        my $scale = abs($target);
+        $scale = 1.0 if $scale < 1.0;
+        my $err = ($actual - $target) / $scale;
+        my $abs_err = abs($err);
+        $max_abs_error = $abs_err if $abs_err > $max_abs_error;
+        push @sq_errors, $err * $err;
+    }
+
+    my $loss = mean(@sq_errors);
+    $loss = $failure_loss unless defined $loss;
+    my $converged = ($max_abs_error < $tol) ? 1 : 0;
+    return { loss => $loss, converged => $converged, status => 'ok' };
+}
+
+sub optimize_task_bo {
+    my ($task, $budget, $lo, $hi, $seed) = @_;
+    my $failure_loss = 1e12;
+    $budget = 1 unless defined $budget && $budget >= 1;
+
+    my @params = @{ $task->{active_params} // [] };
+    if (!@params) {
+        return {
+            key => $task->{key},
+            file_name => $task->{file_name},
+            status => 'no_params',
+            param_value => {},
+            best_loss => $failure_loss,
+            bo_evals => 0,
+            bo_converged => 0,
+        };
+    }
+
+    if (!defined $task->{template_content}) {
+        return {
+            key => $task->{key},
+            file_name => $task->{file_name},
+            status => 'template_missing',
+            param_value => {},
+            best_loss => $failure_loss,
+            bo_evals => 0,
+            bo_converged => 0,
+        };
+    }
+
+    srand($seed);
+    my $dim = scalar(@params);
+    my $warmup = $budget < 5 ? $budget : 5;
+    my $candidate_count = 200;
+    my $kappa = 1.0;
+
+    my @samples;
+    my @losses;
+    my %cache;
+
+    my $default_val = 0;
+    my %best_param_value = map { $_ => $default_val } @params;
+    my $best_loss = $failure_loss;
+    my $best_converged = 0;
+    my $bo_evals = 0;
+
+    for my $iter (0 .. $budget - 1) {
+        my $vec_ref;
+        if ($iter < $warmup || @samples < 2) {
+            my @vec = map { $lo + rand() * ($hi - $lo) } (1 .. $dim);
+            $vec_ref = \@vec;
+        } else {
+            $vec_ref = propose_candidate_by_ucb(
+                \@samples,
+                \@losses,
+                $dim,
+                $lo,
+                $hi,
+                $candidate_count,
+                $kappa
+            );
+        }
+
+        my $param_hash_ref = vec_to_param_hash(\@params, $vec_ref);
+        my $cache_key = param_hash_to_serialized($param_hash_ref, \@params);
+
+        my $eval_res;
+        if (exists $cache{$cache_key}) {
+            $eval_res = $cache{$cache_key};
+        } else {
+            $eval_res = evaluate_task_params($task, $param_hash_ref);
+            $cache{$cache_key} = $eval_res;
+            $bo_evals++;
+        }
+
+        push @samples, [@$vec_ref];
+        push @losses, $eval_res->{loss};
+
+        if ($eval_res->{loss} < $best_loss) {
+            $best_loss = $eval_res->{loss};
+            %best_param_value = %$param_hash_ref;
+            $best_converged = $eval_res->{converged} ? 1 : 0;
+        }
+        if ($eval_res->{converged}) {
+            $best_converged = 1;
+            last;
+        }
+    }
+
+    return {
+        key => $task->{key},
+        file_name => $task->{file_name},
+        status => 'ok',
+        param_value => \%best_param_value,
+        best_loss => $best_loss,
+        bo_evals => $bo_evals,
+        bo_converged => $best_converged,
+    };
+}
+
+sub run_bo_tasks_parallel {
+    my ($tasks_ref, $budget, $seed) = @_;
+    my %results_by_key;
+    return \%results_by_key unless $tasks_ref && @$tasks_ref;
+
+    my $task_dir = "$output_dir/results/_bo_tasks";
+    if (-d $task_dir) {
+        my $err;
+        remove_tree($task_dir, { error => \$err });
+    }
+    make_path($task_dir) unless -d $task_dir;
+
+    my $max_workers = 10;
+    my $running = 0;
+    my $next_idx = 0;
+
+    while ($next_idx < @$tasks_ref || $running > 0) {
+        while ($next_idx < @$tasks_ref && $running < $max_workers) {
+            my $idx = $next_idx;
+            my $pid = fork();
+            die "Cannot generate subprocess: $!" unless defined $pid;
+
+            if ($pid == 0) {
+                my $task = $tasks_ref->[$idx];
+                my $task_seed = $seed + ($idx + 1) * 1009;
+                my $res = optimize_task_bo($task, $budget, $min_param, $max_param, $task_seed);
+                my $result_file = "$task_dir/task_$idx.storable";
+                Storable::store($res, $result_file);
+                exit 0;
+            } else {
+                $running++;
+                $next_idx++;
+            }
+        }
+        my $done = wait();
+        $running-- if $done > 0;
+    }
+
+    for my $idx (0 .. $#$tasks_ref) {
+        my $task = $tasks_ref->[$idx];
+        my $result_file = "$task_dir/task_$idx.storable";
+        my $res;
+        if (-e $result_file) {
+            $res = Storable::retrieve($result_file);
+        } else {
+            $res = {
+                key => $task->{key},
+                file_name => $task->{file_name},
+                status => 'missing_result',
+                param_value => {},
+                best_loss => 1e12,
+                bo_evals => 0,
+                bo_converged => 0,
+            };
+        }
+        $results_by_key{$task->{key}} = $res;
+    }
+
+    return \%results_by_key;
+}
+
+sub apply_best_params_to_tasks {
+    my ($tasks_ref, $results_by_key_ref) = @_;
+    my %seen_dir;
+    my @dirs;
+
+    for my $task (@$tasks_ref) {
+        my $res = $results_by_key_ref->{ $task->{key} };
+        next unless $res;
+        my $params_ref = $res->{param_value} // {};
+        next unless %$params_ref;
+        next unless defined $task->{template_content};
+        my $content = apply_template($task->{template_content}, $params_ref);
+        write_file($task->{template_path}, $content);
+        next if $seen_dir{$task->{dir}}++;
+        push @dirs, $task->{dir};
+    }
+
+    return @dirs;
+}
+
+# =========================
+# 輸出寫入（tuned_params / tuning_report）
 # =========================
 sub write_reports {
-    my ($results, $output_cols, $param_list_ref, $target_by_key) = @_;
+    my ($data_rows_ref, $output_cols_ref, $param_list_ref, $target_by_key_ref, $bo_results_by_key_ref) = @_;
 
     ensure_parent_dir($out_file);
     ensure_parent_dir($report_file);
     open my $out_fh, '>', $out_file or die "Cannot write $out_file: $!";
     open my $rep_fh, '>', $report_file or die "Cannot write $report_file: $!";
 
-    print $out_fh join(',', map { csv_escape($_) } ('File_Path', 'File_Name', @$param_list_ref)), "\n";
+    print $out_fh join(',', map { csv_escape($_) } ('File_Path', 'File_Name', @$param_list_ref, 'BO_Best_Loss', 'BO_Evals', 'BO_Converged')), "\n";
 
     my @report_cols;
-    for my $col (@$output_cols) {
+    for my $col (@$output_cols_ref) {
         push @report_cols, "${col}_final_adjusted", "${col}_target", "${col}_final_error";
     }
-    print $rep_fh join(',', map { csv_escape($_) } ('File_Path', 'File_Name', @report_cols)), "\n";
+    print $rep_fh join(',', map { csv_escape($_) } ('File_Path', 'File_Name', @report_cols, 'BO_Best_Loss')), "\n";
 
-    for my $res (@$results) {
-        my $row = $res->{row};
-        my $param_value = $res->{param_value};
-        my $final_adjusted = $res->{final_adjusted};
-        my $final_error = $res->{final_error};
+    for my $row (@$data_rows_ref) {
         my $key = $row->{$join_key} // '';
-        my $target_row = $target_by_key->{$key} // {};
+        my $target_row = $target_by_key_ref->{$key} // {};
+        my $bo = $bo_results_by_key_ref->{$key} // {};
+        my $param_value = $bo->{param_value} // {};
 
         my @out_row = (
             $row->{'File_Path'} // '',
             $row->{'File_Name'} // ''
         );
-        push @out_row, map { $param_value->{$_} } @$param_list_ref;
+        push @out_row, map { defined $param_value->{$_} ? $param_value->{$_} : '' } @$param_list_ref;
+        push @out_row,
+            (defined $bo->{best_loss} ? $bo->{best_loss} : ''),
+            (defined $bo->{bo_evals} ? $bo->{bo_evals} : ''),
+            (defined $bo->{bo_converged} ? $bo->{bo_converged} : '');
         print $out_fh join(',', map { csv_escape($_) } @out_row), "\n";
 
         my @rep_row = (
             $row->{'File_Path'} // '',
             $row->{'File_Name'} // ''
         );
-        for my $col (@$output_cols) {
-            my $adj = defined $final_adjusted->{$col} ? $final_adjusted->{$col} : '';
+        for my $col (@$output_cols_ref) {
+            my $adj = defined $row->{$col} ? $row->{$col} : '';
             my $tgt = defined $target_row->{$col} ? $target_row->{$col} : '';
-            my $err = defined $final_error->{$col} ? $final_error->{$col} : '';
+            my $err = '';
+            if (is_number($adj) && is_number($tgt)) {
+                if ($tgt == 0) {
+                    $err = abs($adj);
+                } else {
+                    $err = abs($adj / $tgt - 1);
+                }
+            }
             push @rep_row, $adj, $tgt, $err;
         }
+        push @rep_row, (defined $bo->{best_loss} ? $bo->{best_loss} : '');
         print $rep_fh join(',', map { csv_escape($_) } @rep_row), "\n";
     }
 
     close $out_fh;
     close $rep_fh;
-}
-
-sub write_templates {
-    my ($results, $template_content, $changed_only, $output_name) = @_;
-    for my $res (@$results) {
-        next if $changed_only && !$res->{param_changed};
-        my $row = $res->{row};
-        my $param_value = $res->{param_value};
-        my $file_path = $row->{'File_Path'};
-        next unless defined $file_path && $file_path ne '';
-        my $dir = dirname($file_path);
-        my $out_path = "$dir/$output_name";
-        my $content = apply_template($template_content, $param_value);
-        write_file($out_path, $content);
-    }
 }
 
 # =========================
@@ -1222,17 +1453,25 @@ warn_incomplete_indexed_map();
 if ($model ne 'mul' && $model ne 'add') {
     die "Invalid --model '$model'. Use 'mul' or 'add'.\n";
 }
-if ($model eq 'add' && !$step_set) {
-    $step = 1e9;
-}
+warn "[WARN] --model is ignored in --auto mode (BO optimization).\n"
+    if $mode eq 'auto' && $opt_seen{'model'};
 
 my @collect_keys = @collect_data_keys ? @collect_data_keys : sort keys %default_param_map;
 my $tuning_basename = basename($param_tuning_file);
 my @required_files_to_check = map { basename($_) } build_files_to_copy();
 
-sub run_build_and_execute {
+sub run_prepare_output {
     prepare_output_dirs($output_dir, 1);
-    process_output_directories($output_dir, \@required_files_to_check, \@run_commands, undef);
+}
+
+sub run_execute_commands {
+    my ($only_dirs) = @_;
+    process_output_directories($output_dir, \@required_files_to_check, \@run_commands, $only_dirs);
+}
+
+sub run_build_and_execute {
+    run_prepare_output();
+    run_execute_commands(undef);
 }
 
 if ($mode eq 'collect') {
@@ -1247,7 +1486,11 @@ if ($mode eq 'collect') {
 }
 
 if ($mode eq 'no-tune') {
-    run_build_and_execute();
+    run_prepare_output();
+    my @dirs = list_output_dirs($output_dir);
+    my $token_values_ref = build_no_tune_init_values_from_model();
+    initialize_no_tune_tokens_in_dirs(\@dirs, $tuning_basename, $token_values_ref);
+    run_execute_commands(undef);
     collect_merged_data(
         $output_dir,
         $data_file,
@@ -1284,7 +1527,6 @@ if ($matched_key_count == 0) {
       . "'output/results/merged_data.csv' to 'target.csv' and edit target values.\n";
 }
 
-my $template_content = read_file($param_tuning_file);
 my ($map_by_key, $param_list_ref, $param_allowed_ref) = build_param_context($data_header, $data_rows);
 
 my @selected_params = ();
@@ -1304,52 +1546,29 @@ if (@selected_params) {
 }
 die "No parameters selected. Check --params or \\@select_params.\n" unless @$param_list_ref;
 
-my $prev_params = (-e $out_file) ? read_prev_params($out_file, $param_list_ref) : {};
-my $round = 0;
-while (1) {
-    my @output_cols = grep { $_ ne 'File_Path' && $_ ne 'File_Name' } @$data_header;
-    my $iter_limit = 1;
+my @output_cols = grep { $_ ne 'File_Path' && $_ ne 'File_Name' } @$data_header;
+my @tasks = build_bo_tasks(
+    $data_rows,
+    \@output_cols,
+    \%target_by_key,
+    $map_by_key,
+    $param_allowed_ref,
+    $tuning_basename
+);
+die "No BO tasks created. Check mapping/target/selected params.\n" unless @tasks;
 
-    my ($results, $all_ok) = compute_params(
-        $data_rows,
-        \@output_cols,
-        $iter_limit,
-        $prev_params,
-        \%target_by_key,
-        $map_by_key,
-        $param_list_ref,
-        $param_allowed_ref
-    );
-    write_reports($results, \@output_cols, $param_list_ref, \%target_by_key);
+my $bo_results_by_key_ref = run_bo_tasks_parallel(\@tasks, $max_rounds, $bo_seed);
+my @dirs_to_run = apply_best_params_to_tasks(\@tasks, $bo_results_by_key_ref);
+run_execute_commands(\@dirs_to_run) if @dirs_to_run;
 
-    if ($all_ok) {
-        print "Converged at round $round.\n";
-        last;
-    }
+($data_header, $data_rows, $collect_stats) = collect_merged_data(
+    $output_dir,
+    $data_file,
+    \@collect_file_keywords,
+    \@collect_keys
+);
+require_non_empty_rows($data_rows, "output directory '$output_dir' after BO tuning");
+@output_cols = grep { $_ ne 'File_Path' && $_ ne 'File_Name' } @$data_header;
 
-    if ($round >= $max_rounds) {
-        warn "[WARN] reached max_rounds without convergence\n";
-        last;
-    }
-
-    write_templates($results, $template_content, 1, $tuning_basename);
-
-    my @dirs_to_run = map { $_->{dir} } grep { $_->{param_changed} && $_->{dir} ne '' } @$results;
-    if (!@dirs_to_run) {
-        warn "[WARN] no directories need re-run; stopping to avoid infinite loop\n";
-        last;
-    }
-
-    process_output_directories($output_dir, \@required_files_to_check, \@run_commands, \@dirs_to_run);
-    ($data_header, $data_rows, $collect_stats) = collect_merged_data(
-        $output_dir,
-        $data_file,
-        \@collect_file_keywords,
-        \@collect_keys
-    );
-    require_non_empty_rows($data_rows, "output directory '$output_dir' after auto rerun");
-    $prev_params = params_from_results($results, $param_list_ref);
-    $round++;
-}
-
-print "Auto flow complete. Output: $out_file, Report: $report_file, Merged: $data_file\n";
+write_reports($data_rows, \@output_cols, $param_list_ref, \%target_by_key, $bo_results_by_key_ref);
+print "Auto BO flow complete. Output: $out_file, Report: $report_file, Merged: $data_file\n";
