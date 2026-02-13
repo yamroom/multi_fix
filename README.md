@@ -1,73 +1,144 @@
 # `tune_params.pl` 使用說明（Collect / No-tune / Auto）
 
-本文件以目前程式實作為準。
+本文件以目前程式實作為準（`tune_params.pl`）。
 
-## 三模式定義
+## 1. 三種模式
 
 1. `--collect`
-- 只做資料蒐集。
-- 只讀取 `output/` 下遞迴掃描到的 `.txt`。
-- 只處理檔名符合 `@collect_file_keywords` 的檔案（例如 `all.txt`）。
-- 不執行外部指令、不調參、不回寫模板。
-- 輸出：`merged_data.csv`。
+- 只收集 `output/` 下的 `.txt` 資料並輸出 `merged_data.csv`。
+- 不執行 `n1.sh`、不調參。
 
 2. `--no-tune`
-- 固定執行：生成資料夾 -> 執行指令 -> 收集資料。
-- 不做調參。
+- 流程：建立 output 子資料夾 -> 初始化 token -> 執行 commands -> collect。
+- 不做 BO。
 - 輸出：`merged_data.csv`。
 
 3. `--auto`
-- 固定執行：生成資料夾 -> 執行指令 -> 收集資料 -> 調參。
-- 每輪只重跑參數有變更的資料夾。
+- 流程：建立 output 子資料夾 -> 初始化 token -> 第一次執行 commands -> collect -> BO -> 套用最佳參數後 rerun -> 第二次 collect -> 寫報表。
 - 輸出：`merged_data.csv`、`tuned_params.csv`、`tuning_report.csv`。
 
-## 流程圖（文字版）
+## 2. `--auto` 實際步驟（對應 STDERR log）
 
-- `collect`: scan `output/*.txt` (recursive) -> parse keys -> write `merged_data.csv`
-- `no-tune`: prepare output dirs -> run commands -> collect -> write `merged_data.csv`
-- `auto`: prepare output dirs -> run commands -> collect -> tune loop -> write 3 CSV files
+程式會在 STDERR 印進度（不污染 stdout/CSV）：
 
-## 收集規則（collect/no-tune/auto 共用）
+1. `Step 1`：`prepare_output_dirs` 開始/結束。
+2. `Step 1.5`：token 初始化（`add -> 0`，`mul -> 1`）。
+3. `Step 2`：第一次執行 commands（全 dirs）。
+4. `Step 3`：第一次 collect（寫 `merged_data.csv`）。
+5. `Step 4`：讀 `target.csv` + 建立 join-key 對應。
+6. `Step 5`：確定可調參數清單。
+7. `Step 6`：建立 BO tasks。
+8. `Step 6.1`：BO 任務進度（completed/total）。
+9. `Step 6.2`：BO 摘要（converged / likely_bound_limited / missing_result）。
+10. `Step 7`：套用最佳參數後 rerun。
+11. `Step 8`：第二次 collect。
+12. `Step 9`：寫 `tuned_params.csv` 與 `tuning_report.csv`。
+13. `Final`：流程完成。
 
-- 掃描範圍：`output` 下遞迴所有檔案。
-- 檔案類型：只收 `.txt`。
-- 檔名過濾：由 `@collect_file_keywords` 決定。
-- 行內解析：每一行會用 global 掃描抓出所有 `key[:=]value` 片段。
-  - 例如 `cgc=6 D = 5.4` 會解析出 `cgc=6` 與 `D=5.4`，但只收目標 key。
-- 關鍵字欄位：
-  - 若 `@collect_data_keys` 非空，使用它。
-  - 否則使用 `%default_param_map` 的 keys（依目前設定）。
-- 非目標 key（例如 `cgc`,`hihi`,`1-sigma`）會直接忽略，不寫入輸出欄位。
-- 目標 key 若值非數值（例如 `D=abc`），該欄位留空並繼續流程。
-- 若符合檔名關鍵字但內容沒有對應 key，該列保留，值為空字串。
-- 若有 `.txt` 檔但沒有任何檔名命中關鍵字，仍會生成 `merged_data.csv`（只有表頭）。
-- 若 `output` 不存在，直接報錯。
-- 若完全沒有 `.txt`，直接報錯。
+## 3. `n1.sh` 在單一子資料夾最多會跑幾次？
 
-## 重複鍵處理（Indexed Keys）
+### `--auto`
+單一 task（通常對應一個 output 子資料夾）在目前版本的上限為：
 
-- source format 以 base key 為準（例如 `D=...` 重複多行）。
-- 若 `%default_param_map` 只定義 base key（例如 `D`）且 source 有重複 `D`：
-  - 會自動編號成 `D_1`,`D_2`,...（依出現順序）。
-  - 欄位排序採自然排序（例如 `D_1,D_2,D_3,...`）。
-- 若 `%default_param_map` 使用 indexed key（例如 `D_1`,`D_2`）：
-  - collector 仍以 base key 行（`D=...`）作為 canonical input。
-  - 若 source 檔內同時出現顯式 indexed 行（如 `D_1=...`），會忽略顯式 indexed 行。
-- 若定義了 `D_1,D_2` 但檔案只有 1 個 `D`，`D_2` 會留空。
-- collector 會輸出摘要 warning（duplicate/missing/overflow 統計），不輸出每檔明細 spam。
+- 第一次基準執行：`1` 次（Step 2）
+- BO evaluate 總上限：`TR_TOTAL_EVAL_CAP` 次
+- 套 best 後 rerun：`1` 次（Step 7）
 
-## Auto 模式對應規則
+所以目前（`TR_TOTAL_EVAL_CAP = 24`）：
 
-- `auto` 模式要求 `%default_param_map` 的 key 必須和收集結果欄位完全對得上。
-- 例如 source 有兩個 `D`，收集會得到 `D_1,D_2`；此時若 map 仍是 `D => D1_p`，`auto` 會被阻擋並提示你改成顯式欄位（例如 `D_1 => D1_p, D_2 => D2_p`）。
-- 這樣可避免調參時用錯欄位造成不可靠結果。
+`最多 = 1 + 24 + 1 = 26 次`
 
-## Map 索引缺口警告
+### `--no-tune`
+- 通常是 `1` 次（只做一次 commands）。
 
-- 若 `%default_param_map` 有 indexed key 缺口（例如只有 `D_2` 沒有 `D_1`），程式會輸出 warning。
-- 這個檢查是 warning-only，不會中止 `collect/no-tune/auto` 流程。
+### `--collect`
+- `0` 次（不執行 commands）。
 
-## CLI 對照表（嚴格模式）
+## 4. BO 重要參數（你常問的）
+
+目前關鍵常數：
+
+- `TR_TOTAL_EVAL_CAP = 24`
+- `LOCAL_REFINE_EVAL_RESERVE = 13`
+- `LOCAL_REFINE_EXTRA_EVAL_CAP = 240`
+
+白話解釋：
+
+1. `TR_TOTAL_EVAL_CAP`
+- 每個 task 的**硬上限**評估次數（BO + local refine 合計）。
+- 真正決定「最多 evaluate 幾次」的是它。
+
+2. `LOCAL_REFINE_EVAL_RESERVE`
+- 預留給 local refine 的配額。
+- BO 主階段可用大約是：`TR_TOTAL_EVAL_CAP - LOCAL_REFINE_EVAL_RESERVE`（至少會保留 1）。
+
+3. `LOCAL_REFINE_EXTRA_EVAL_CAP`
+- local refine 想額外吃的「意圖上限」。
+- 但最後仍會被 `TR_TOTAL_EVAL_CAP` 截斷，所以不是硬上限。
+
+## 5. `--max-rounds` 在目前實作的語意
+
+- `--max-rounds` 是 BO 初始預算（不是最終硬上限）。
+- 實際 BO 會自動延伸（`TR_EXTENSION_CHUNK`）直到 BO phase cap。
+- 最終 evaluate 仍不可超過 `TR_TOTAL_EVAL_CAP`。
+
+## 6. 收斂與 loss
+
+目前 objective（Hinge-Hybrid）：
+
+`loss = max_abs_error + OBJ_MSE_WEIGHT * mse + OBJ_HINGE_WEIGHT * max(0, max_abs_error - tol)^2`
+
+目前預設：
+
+- `OBJ_MSE_WEIGHT = 0.10`
+- `OBJ_HINGE_WEIGHT = 3.0`
+
+收斂條件：
+
+- `max_abs_error < tol`
+
+## 7. `likely_bound_limited` 是什麼？
+
+當 task 沒收斂且評估已打到 cap，而且最佳參數貼近邊界比例達門檻時，會標記：
+
+- `status = likely_bound_limited`
+
+用意：
+
+- 提醒「可能不是演算法壞掉，而是你給的 `min/max` 範圍太窄」。
+
+## 8. Token 初始化（`--no-tune` 與 `--auto`）
+
+兩種模式都會在第一次跑 commands 前做 token 初始化：
+
+- `model=add` -> token 初值 `0`
+- `model=mul` -> token 初值 `1`
+
+注意：
+
+- `--auto` 下 `--model` 不影響 BO 搜尋策略本身，只影響這個初始化行為。
+
+## 9. 輸出檔案
+
+1. `output/results/merged_data.csv`
+- collect 後彙整資料。
+
+2. `output/results/tuned_params.csv`（auto）
+- 每個 task 的最佳參數、`BO_Best_Loss`、`BO_Evals`、`BO_Converged`。
+
+3. `output/results/tuning_report.csv`（auto）
+- 各欄位最終值、target、誤差與最佳 loss。
+
+## 10. 收集規則（collect/no-tune/auto 共用）
+
+- 掃描 `output/` 遞迴下的 `.txt`。
+- 只處理檔名符合 `@collect_file_keywords`（例如 `all.txt`）。
+- 逐行擷取 `key[:=]value` 片段。
+- `@collect_data_keys` 若有值就用它；否則用 `%default_param_map` 的 keys。
+- 重複 key 會按出現順序編號（如 `D_1`, `D_2`）。
+- 程式會輸出 collect 摘要 warning（duplicate/missing/overflow），不會中止流程。
+
+## 11. CLI 對照（嚴格模式）
 
 | Option | 用途 | collect | no-tune | auto |
 |---|---|---:|---:|---:|
@@ -75,78 +146,49 @@
 | `--no-tune` | no-tune 模式 | N | Y | N |
 | `--auto` | auto 模式 | N | N | Y |
 | `--data` | merged_data 路徑 | Y | Y | Y |
-| `--tuning-file` / `--template` | 指定模板檔 | N | Y | Y |
+| `--tuning-file` / `--template` | 模板檔 | N | Y | Y |
 | `--target` | 目標 CSV | N | N | Y |
-| `--out` | tuned_params 輸出路徑 | N | N | Y |
-| `--report` | tuning_report 輸出路徑 | N | N | Y |
+| `--out` | tuned_params 路徑 | N | N | Y |
+| `--report` | tuning_report 路徑 | N | N | Y |
 | `--params` | 只調指定參數 | N | N | Y |
-| `--model` | `add` 或 `mul` | N | N | Y |
+| `--model` | `add` 或 `mul` | N | Y | Y |
 | `--tol` | 收斂容差 | N | N | Y |
 | `--step` | 每輪最大變化 | N | N | Y |
-| `--min-param` | 參數下限 | N | N | Y |
-| `--max-param` | 參數上限 | N | N | Y |
-| `--max-rounds` | 最大輪數 | N | N | Y |
+| `--min-param` | 全域參數下限 | N | N | Y |
+| `--max-param` | 全域參數上限 | N | N | Y |
+| `--max-rounds` | BO 初始預算 | N | N | Y |
+| `--bo-seed` | BO 隨機種子 | N | N | Y |
 | `--join-key` | data/target 對齊欄位 | N | N | Y |
 | `--help` | 顯示說明 | Y | Y | Y |
 
-說明：
-- 嚴格防呆啟用。若模式不相干參數被帶入（例如 `--collect --step 2`），程式會直接報錯。
-- 同時指定多個模式（例如 `--collect --auto`）會直接報錯。
-- 不指定模式也會直接報錯。
+補充：
 
-## 已移除選項
+- 模式衝突或不相干參數會直接報錯。
+- 不指定模式也會報錯。
 
-- `--full`
-- `--no-clean`
-- `--emit-merged`
-- `--max-iter`
+## 12. 建議操作順序
 
-## 常見錯誤對照
+1. 先跑 no-tune 產生基準資料
 
-1. `Mode required...`
-- 沒有指定 `--collect` / `--no-tune` / `--auto`。
-
-2. `Mode conflict...`
-- 同時指定了多個模式。
-
-3. `Option '--xxx' is not allowed in --collect mode.`
-- 該參數不適用目前模式。
-
-4. `Output folder 'output' not found.`
-- collect 模式下找不到 output 目錄。
-
-5. `No .txt files found under 'output'.`
-- output 內沒有可收集文字檔。
-
-6. `No matching 'File_Path' between collected data and 'target.csv'.`
-- auto 模式下，收集資料與 target 完全對不到。
-
-7. `[WARN] collect summary: ...`
-- 表示收集過程偵測到重複 base key、缺少 indexed key、或 overflow 擴欄。
-
-8. `[WARN] incomplete indexed keys in %default_param_map: ...`
-- 表示 map 有索引缺口（例如缺 `D_1`），目前是警告不中止。
-
-## 建議操作順序
-
-1. 先執行 `no-tune` 產生基準資料：
 ```bash
 perl tune_params.pl --no-tune
 ```
 
-2. 以 `output/results/merged_data.csv` 為基礎手動更新 `target.csv`。
+2. 參考 `output/results/merged_data.csv` 更新 `target.csv`
 
-3. 執行 auto 調參：
+3. 跑 auto 調參
+
 ```bash
 perl tune_params.pl --auto
 ```
 
-4. 若只想檢查目前 output 內資料，不重跑任何指令：
+4. 若只想重新彙整，不重跑 commands
+
 ```bash
 perl tune_params.pl --collect
 ```
 
-## 快速指令
+## 13. 快速指令
 
 ```bash
 perl tune_params.pl --help
