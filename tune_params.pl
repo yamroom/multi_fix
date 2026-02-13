@@ -1041,7 +1041,7 @@ sub initialize_no_tune_tokens_in_dirs {
 # =========================
 # BO 輔助（單目錄評估、候選提案、並行任務）
 # =========================
-my $TR_TOTAL_EVAL_CAP = 50;
+my $TR_TOTAL_EVAL_CAP = 24;
 my $TR_EXTENSION_CHUNK = 20;
 my $TR_INIT_LEN = 0.60;
 my $TR_MIN_LEN = 0.015625; # 1/64
@@ -1063,11 +1063,13 @@ my $OBJ_HINGE_WEIGHT = 3.0;
 my $LOCAL_REFINE_MAX_STARTS = 3;
 my $LOCAL_REFINE_MAX_ITERS = 30;
 my $LOCAL_REFINE_EXTRA_EVAL_CAP = 240;
-my $LOCAL_REFINE_EVAL_RESERVE = 8;
+my $LOCAL_REFINE_EVAL_RESERVE = 13;
 my $LOCAL_REFINE_EARLY_FACTOR = 2.0;
 my $LOCAL_REFINE_LAMBDA_INIT = 1e-3;
 my $LOCAL_REFINE_STEP_FRAC = 1e-3;
 my $LOCAL_REFINE_STEP_MIN = 1e-3;
+my $BOUND_NEAR_RATIO_THRESH = 0.67;
+my $BOUND_NEAR_MARGIN_RATIO = 0.02;
 
 sub clip01 {
     my ($x) = @_;
@@ -1959,6 +1961,38 @@ sub optimize_task_bo {
         }
     }
 
+    my $near_bound_ratio = 0;
+    my $near_bound_count = 0;
+    if (@params) {
+        for my $i (0 .. $#params) {
+            my $name = $params[$i];
+            my $v = $best_param_value{$name};
+            next unless defined $v;
+            my $lo_i = bound_at($lo, $i);
+            my $hi_i = bound_at($hi, $i);
+            next unless defined $lo_i && defined $hi_i && $hi_i > $lo_i;
+            my $range = $hi_i - $lo_i;
+            my $margin = $BOUND_NEAR_MARGIN_RATIO * $range;
+            if (abs($v - $lo_i) <= $margin || abs($hi_i - $v) <= $margin) {
+                $near_bound_count++;
+            }
+        }
+        $near_bound_ratio = @params ? ($near_bound_count / scalar(@params)) : 0;
+    }
+    my $near_bound_required = @params ? int((scalar(@params) + 2) / 3) : 0; # ceil(dim / 3)
+    my $likely_bound_limited = (
+        !$best_converged
+        && $bo_evals >= $TR_TOTAL_EVAL_CAP
+        && (
+            $near_bound_ratio >= $BOUND_NEAR_RATIO_THRESH
+            || ($near_bound_required > 0 && $near_bound_count >= $near_bound_required)
+        )
+    ) ? 1 : 0;
+    if ($likely_bound_limited) {
+        log_info("bound_hint: task=$task->{key} likely bound-limited (near_bound_ratio="
+            . format_val($near_bound_ratio) . ", min_param=$min_param, max_param=$max_param)");
+    }
+
     log_info(
         "task=$task->{key} evals=$bo_evals bo_phase_evals=$bo_phase_evals bo_phase_cap=$bo_eval_cap total_cap=$TR_TOTAL_EVAL_CAP converged=$best_converged restarts=$restart_count "
         . "restart_random=$restart_random_count restart_elite=$restart_elite_count "
@@ -1973,7 +2007,7 @@ sub optimize_task_bo {
     return {
         key => $task->{key},
         file_name => $task->{file_name},
-        status => 'ok',
+        status => ($likely_bound_limited ? 'likely_bound_limited' : 'ok'),
         param_value => \%best_param_value,
         best_loss => $best_loss,
         best_max_abs => $best_max_abs,
@@ -2067,6 +2101,17 @@ sub run_bo_tasks_parallel {
         }
         $results_by_key{$task->{key}} = $res;
     }
+
+    my $converged_count = 0;
+    my $likely_bound_count = 0;
+    my $missing_result_count = 0;
+    for my $task (@$tasks_ref) {
+        my $res = $results_by_key{$task->{key}} // {};
+        $converged_count++ if ($res->{bo_converged} // 0);
+        $likely_bound_count++ if (($res->{status} // '') eq 'likely_bound_limited');
+        $missing_result_count++ if (($res->{status} // '') eq 'missing_result');
+    }
+    log_info("Step 6.2: BO summary converged=$converged_count/$total, likely_bound_limited=$likely_bound_count, missing_result=$missing_result_count");
 
     return \%results_by_key;
 }
@@ -2174,6 +2219,15 @@ warn_incomplete_indexed_map();
 
 if ($model ne 'mul' && $model ne 'add') {
     die "Invalid --model '$model'. Use 'mul' or 'add'.\n";
+}
+if ($tol <= 0) {
+    die "Invalid --tol '$tol'. Use a positive number.\n";
+}
+if ($min_param >= $max_param) {
+    die "Invalid param range: --min-param ($min_param) must be smaller than --max-param ($max_param).\n";
+}
+if ($max_rounds < 1) {
+    die "Invalid --max-rounds '$max_rounds'. Use integer >= 1.\n";
 }
 warn "[WARN] --model 在 --auto 模式不影響 BO 搜尋；僅用於第一次執行前的 token 初始化（add->0, mul->1）。\n"
     if $mode eq 'auto' && $opt_seen{'model'};
